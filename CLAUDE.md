@@ -220,6 +220,21 @@ controlled by `RAY_PROMETHEUS_HOST`. The flow on the head/single node:
    `sigv4: {region}` block for AMP or a `basic_auth` block for self-hosted, and writes it back.
    Injection happens **before** Prometheus launches.
 
+**Embedded Grafana** (`_launch_grafana`). Opt-in via `--grafana-path` / `grafana_path`, for clusters
+that can reach neither an external Prometheus nor a Grafana instance. `_copy_grafana_binary`
+extracts the archive into `/opt/ml/code` — the folder name is read from the archive
+(`_get_archive_root_folder`) because it does not match the archive name
+(`grafana-12.0.1.linux-amd64.tar.gz` → `grafana-v12.0.1`). Grafana is then started from the config
+the Ray Dashboard generates in `RAY_GRAFANA_CONFIG_DIR`
+(`/tmp/ray/session_latest/metrics/grafana`), which already carries `allow_embedding`, anonymous
+auth, the Prometheus datasource and the Ray dashboards with the UIDs the Metrics tab embeds;
+`_write_grafana_fallback_config` covers the case where Ray never wrote it.
+`_build_grafana_command` prefers `bin/grafana server` (Grafana 10+) over the deprecated
+`bin/grafana-server`. `_create_runtime_environment` defaults `RAY_GRAFANA_HOST` to loopback and
+`RAY_GRAFANA_IFRAME_HOST` to `localhost` (the browser reaches it through SSM port forwarding),
+never overriding user-provided values. The whole path is best effort: every failure is logged, none
+fails the job.
+
 Config-path selection (`_get_prometheus_config_path`, L567): `ray metrics launch-prometheus`
 uses the Ray package template path; a custom binary uses the session config
 `/tmp/ray/session_latest/metrics/prometheus/prometheus.yml`. For offline clusters, pass a
@@ -231,8 +246,9 @@ tar.gz into `/opt/ml/code`, verifies size, and extracts it with the traversal-sa
 
 All shelling-out is centralized and hardened:
 
-- `_validate_command` (L992): allowlist — only `ray`, `bash`, `./prometheus-*`, or
-  `/opt/ml/code/prometheus-*` may run; anything else raises `ValueError`.
+- `_validate_command` (L992): allowlist — only `ray`, `bash`, `./prometheus-*`,
+  `/opt/ml/code/prometheus-*`, or the Grafana binaries under `/opt/ml/code/grafana-*/bin`
+  (`_is_grafana_executable`) may run; anything else raises `ValueError`.
 - `_run_subprocess_command` / `_run_subprocess_command_with_env` (L1015/L1050): `shlex.split`
   the command, validate it, run with `shell=False`, capture output, optionally `check`.
 - `_run_subprocess_command_async` (L1082): `Popen` for long-running processes (Ray start,
@@ -274,7 +290,7 @@ All shelling-out is centralized and hardened:
   `ray_sagemaker_training_dashboard.json`.
 - **Every CLI arg has an env-var fallback** with the same name (`wait_shutdown`,
   `head_instance_group`, `head_num_cpus`, `head_num_gpus`, `launch_prometheus`,
-  `prometheus_path`) via the ModelTrainer `environment` dict.
+  `prometheus_path`, `grafana_path`, `grafana_port`) via the ModelTrainer `environment` dict.
 - **Prefer short env-var names** (e.g. `RAY_PROMETHEUS_USERNAME`, not
   `RAY_PROMETHEUS_REMOTE_WRITE_USERNAME`).
 - **No custom Dockerfile** — runs on the stock SageMaker PyTorch container; deps come from

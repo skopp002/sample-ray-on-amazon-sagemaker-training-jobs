@@ -20,6 +20,8 @@ This repository demonstrates how to use Ray for distributed data processing and 
   - [Remote Write to an External Prometheus](#remote-write-to-an-external-prometheus)
     - [Amazon Managed Service for Prometheus (AMP)](#amazon-managed-service-for-prometheus-amp)
     - [Self-hosted Prometheus](#self-hosted-prometheus)
+  - [(Optional) Provide Prometheus binary file](#optional-provide-prometheus-binary-file)
+  - [(Optional) Embedded Prometheus and Grafana for isolated environments](#optional-embedded-prometheus-and-grafana-for-isolated-environments)
   - [Grafana Dashboards](#grafana-dashboards)
 
 ## Prerequisites
@@ -102,6 +104,7 @@ The `launcher.py` script serves as the entry point for SageMaker training jobs a
 - Coordinating between head and worker nodes in a distributed setup
 - Configuring EFA/RDMA networking for supported GPU instances
 - Optionally launching Prometheus for metrics collection
+- Optionally launching an embedded Grafana server for the Ray Dashboard metrics tab
 - Executing the appropriate user script (Python `.py` or Bash `.sh`)
 - Graceful shutdown with configurable wait period
 
@@ -133,6 +136,8 @@ The `launcher.py` script requires specific parameters to execute your custom tra
 | `--include-dashboard`   | bool   | No       | True             | Enable Ray dashboard                                                     |
 | `--launch-prometheus`   | bool   | No       | True             | Launch local Prometheus on the head node. Internet connectivity required |
 | `--prometheus-path`     | string | No       | None             | Path to prometheus binary if provided as InputData                       |
+| `--grafana-path`        | string | No       | None             | Path to the Grafana archive if provided as InputData. Starts an embedded Grafana on the head node |
+| `--grafana-port`        | int    | No       | 3000             | Port used by the embedded Grafana server                                 |
 | `--wait-shutdown`       | int    | No       | None             | Seconds to wait before Ray shutdown                                      |
 
 \*Required only for heterogeneous clusters
@@ -148,6 +153,8 @@ All parameters above can also be set as environment variables via the `environme
 | `head_num_gpus`           | int    | No       | Alternative way to set number of GPUs reserved for head node                                                                                                            |
 | `launch_prometheus`       | bool   | No       | Alternative way to enable/disable local Prometheus on the head node (default: true). Internet connectivity required                                                     |
 | `prometheus_path`         | string | No       | Path to prometheus binary if provided as InputData                                                                                                                      |
+| `grafana_path`            | string | No       | Path to the Grafana archive if provided as InputData. Starts an embedded Grafana on the head node                                                                        |
+| `grafana_port`            | int    | No       | Alternative way to set the port of the embedded Grafana server (default: `3000`)                                                                                         |
 | `wait_shutdown`           | int    | No       | Alternative way to set shutdown wait time                                                                                                                               |
 | `RAY_PROMETHEUS_HOST`     | string | No       | Prometheus host URL. When set to a remote URL (not localhost), enables remote_write from local Prometheus to the remote endpoint. For AMP URLs, SigV4 auth is automatic |
 | `RAY_PROMETHEUS_NAME`     | string | No       | Prometheus data source name in Grafana (default: `Prometheus`). Used by the Ray Dashboard for Grafana integration                                                       |
@@ -595,6 +602,99 @@ source_code = SourceCode(
 )
 ```
 
+### (Optional) Embedded Prometheus and Grafana for isolated environments
+
+The options above assume the training job can reach a metrics backend: AMP, a self-hosted
+Prometheus, or a Grafana instance. When the cluster runs in an isolated VPC with no route to any
+of them, both Prometheus **and** Grafana can run inside the training container itself, on the head
+node. Prometheus scrapes the Ray metrics over loopback and the embedded Grafana renders them,
+including in the **Metrics** tab of the Ray Dashboard.
+
+Pass the Grafana archive with `--grafana-path` (alongside `--prometheus-path`) and the launcher:
+
+1. Extracts the archive into `/opt/ml/code`
+2. Provisions Grafana from the configuration the Ray Dashboard generates in
+   `/tmp/ray/session_latest/metrics/grafana` — the Prometheus datasource and the Ray dashboards,
+   with the UIDs the Metrics tab embeds, so no dashboard has to be imported manually
+3. Starts `bin/grafana server` on port `3000` (`--grafana-port` to change it) with anonymous
+   `Viewer` access and `allow_embedding` enabled, which the Dashboard iframes require
+4. Sets `RAY_GRAFANA_HOST` to `http://127.0.0.1:<port>` for the Dashboard backend and
+   `RAY_GRAFANA_IFRAME_HOST` to `http://localhost:<port>` for the browser. Values you provide
+   explicitly always take precedence
+5. Stops Grafana when the job shuts down
+
+Failures are logged and never fail the training job: Prometheus keeps collecting metrics even if
+Grafana does not come up.
+
+**Step 1:** Download the Prometheus and Grafana archives:
+
+```bash
+wget https://github.com/prometheus/prometheus/releases/download/v3.4.2/prometheus-3.4.2.linux-amd64.tar.gz
+wget https://dl.grafana.com/oss/release/grafana-12.0.1.linux-amd64.tar.gz
+```
+
+**Step 2:** Upload both to S3 and configure them as training inputs:
+
+```python
+from sagemaker.train.configs import InputData, S3DataSource
+
+prometheus_input = InputData(
+    channel_name="prometheus",
+    data_source=S3DataSource(
+        s3_data_type="S3Prefix",
+        s3_uri="s3://<bucket>/path/to/prometheus-3.4.2.linux-amd64.tar.gz",
+        s3_data_distribution_type="FullyReplicated",
+    ),
+)
+
+grafana_input = InputData(
+    channel_name="grafana",
+    data_source=S3DataSource(
+        s3_data_type="S3Prefix",
+        s3_uri="s3://<bucket>/path/to/grafana-12.0.1.linux-amd64.tar.gz",
+        s3_data_distribution_type="FullyReplicated",
+    ),
+)
+```
+
+**Step 3:** Pass both paths to the launcher:
+
+```python
+source_code = SourceCode(
+    source_dir="./scripts",
+    requirements="requirements.txt",
+    command=(
+        "python launcher.py --entrypoint train_ray.py"
+        " --prometheus-path /opt/ml/input/data/prometheus/prometheus-3.4.2.linux-amd64.tar.gz"
+        " --grafana-path /opt/ml/input/data/grafana/grafana-12.0.1.linux-amd64.tar.gz"
+    ),
+)
+```
+
+**Step 4:** Forward both the Dashboard and the Grafana port, in two separate sessions:
+
+```bash
+aws ssm start-session --target sagemaker-training-job:<training-job-name>_algo-1 \
+--region <aws_region> \
+--document-name AWS-StartPortForwardingSession \
+--parameters '{"portNumber":["8265"],"localPortNumber":["8265"]}'
+
+aws ssm start-session --target sagemaker-training-job:<training-job-name>_algo-1 \
+--region <aws_region> \
+--document-name AWS-StartPortForwardingSession \
+--parameters '{"portNumber":["3000"],"localPortNumber":["3000"]}'
+```
+
+Open `localhost:8265` and the Metrics tab renders the Grafana panels; Grafana itself is available
+on `localhost:3000`:
+
+![Ray Dashboard Grafana](./images/ray_dashboard_grafana.png)
+
+> **Note:** Both processes live and die with the training job, so the metrics are gone once the job
+> ends. To keep them, combine this setup with
+> [remote write](#remote-write-to-an-external-prometheus) whenever an external Prometheus is
+> reachable.
+
 ### Grafana Dashboards
 
 This repository includes pre-built Ray Grafana dashboards in the [`grafana-dashboards/`](./grafana-dashboards) directory:
@@ -621,7 +721,7 @@ When using AMP as the metrics backend, configure your Grafana instance (Amazon M
 4. Set the **Scrape interval** to `10s` to match the Prometheus configuration
 5. Click **Save & test** to verify connectivity
 
-> **Note:** Grafana iframe embedding in the Ray Dashboard requires `allow_embedding = true` and anonymous auth in `grafana.ini`, which is only available with self-hosted Grafana. AWS Managed Grafana does not expose these settings. Use Managed Grafana dashboards directly in a separate browser tab.
+> **Note:** Grafana iframe embedding in the Ray Dashboard requires `allow_embedding = true` and anonymous auth in `grafana.ini`, which is only available with self-hosted Grafana. AWS Managed Grafana does not expose these settings. Use Managed Grafana dashboards directly in a separate browser tab, or run the [embedded Grafana](#optional-embedded-prometheus-and-grafana-for-isolated-environments) on the head node, which sets both options and provisions these dashboards automatically.
 
 ## Authors
 

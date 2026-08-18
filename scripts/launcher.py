@@ -70,6 +70,13 @@ RAY_CONNECTION_TIMEOUT = 300  # seconds (5 minutes)
 # Prometheus timer
 PROMETHEUS_WAIT_SECONDS = 300
 
+# Grafana configuration
+DEFAULT_GRAFANA_PORT = 3000
+GRAFANA_WAIT_SECONDS = 120
+GRAFANA_CONFIG_WAIT_SECONDS = 60
+# Folder where the Ray Dashboard generates its Grafana configuration
+RAY_GRAFANA_CONFIG_DIR = "/tmp/ray/session_latest/metrics/grafana"
+
 # Status and ready files
 FAILURE_REASON_PATH = "/opt/ml/output/failure"
 
@@ -79,6 +86,10 @@ ray_initialized = False
 has_failure = False
 # Global variable to track the Prometheus folder name
 prometheus_folder_name = None
+# Global variable to track the Grafana folder name
+grafana_folder_name = None
+# Global variable to track the embedded Grafana process
+grafana_process = None
 
 
 def signal_handler(signum: int, frame: Any) -> None:
@@ -282,6 +293,20 @@ def _parse_args():
     )
 
     parser.add_argument(
+        "--grafana-path",
+        type=str,
+        default=None,
+        help="Path to the grafana tar.gz file to copy to /opt/ml/code. Providing it starts an embedded Grafana server on the head node",
+    )
+
+    parser.add_argument(
+        "--grafana-port",
+        type=int,
+        default=DEFAULT_GRAFANA_PORT,
+        help="Port used by the embedded Grafana server",
+    )
+
+    parser.add_argument(
         "--wait-shutdown",
         type=int,
         default=None,
@@ -385,6 +410,40 @@ def _parse_args():
                 "Using prometheus_path from environment variable: %s",
                 args.prometheus_path,
             )
+
+    # Handle grafana_path parameter from environment variable if not provided as argument
+    if args.grafana_path is None:
+        env_grafana_path = os.environ.get("grafana_path")
+        if env_grafana_path is not None:
+            args.grafana_path = env_grafana_path
+            logger.info(
+                "Using grafana_path from environment variable: %s",
+                args.grafana_path,
+            )
+
+    # Handle grafana_port parameter from environment variable if not provided as argument
+    if args.grafana_port == DEFAULT_GRAFANA_PORT:
+        env_grafana_port = os.environ.get("grafana_port")
+        if env_grafana_port is not None:
+            try:
+                args.grafana_port = int(env_grafana_port)
+                logger.info(
+                    "Using grafana_port from environment variable: %s",
+                    args.grafana_port,
+                )
+            except ValueError:
+                logger.warning(
+                    "Invalid grafana_port environment variable value: %s. Must be an integer.",
+                    env_grafana_port,
+                )
+
+    # The embedded Grafana only serves the Ray Dashboard Metrics tab, which is not
+    # available when the Dashboard is disabled.
+    if args.grafana_path and not args.include_dashboard:
+        logger.warning(
+            "Ignoring grafana_path %s: the embedded Grafana requires --include-dashboard",
+            args.grafana_path,
+        )
 
     # If entrypoint is provided, parse it and set environment variables
     if args.entrypoint:
@@ -765,6 +824,296 @@ def _inject_instance_type_relabel(
         logger.error("Failed to inject instance_type relabel: %s", e)
 
 
+GRAFANA_INI_TEMPLATE = """[security]
+allow_embedding = true
+
+[auth.anonymous]
+enabled = true
+org_name = Main Org.
+org_role = Viewer
+
+[paths]
+provisioning = {provisioning_dir}
+"""
+
+
+def _get_archive_root_folder(tar: tarfile.TarFile) -> str:
+    """Return the single top level folder contained in a tar archive.
+
+    Args:
+        tar: The TarFile object to inspect
+
+    Returns:
+        Name of the top level folder
+
+    Raises:
+        ValueError: If the archive does not contain exactly one top level folder
+    """
+    roots = {
+        name.split("/")[0]
+        for name in tar.getnames()
+        if name and not name.startswith("/") and name not in (".", "./")
+    }
+    if len(roots) != 1:
+        raise ValueError(
+            f"Expected a single top level folder in the archive, found: {sorted(roots)}"
+        )
+    return roots.pop()
+
+
+def _copy_grafana_binary(grafana_path: str) -> str:
+    """Copy the grafana tar.gz file to /opt/ml/code directory and extract it.
+
+    Args:
+        grafana_path: Path to the grafana tar.gz file
+
+    Returns:
+        The name of the extracted folder
+
+    Raises:
+        FileNotFoundError: If the grafana file doesn't exist
+        Exception: If there are errors during file copy or extraction
+    """
+    import shutil
+
+    if not os.path.exists(grafana_path):
+        raise FileNotFoundError(f"Grafana binary file not found: {grafana_path}")
+
+    destination_dir = "/opt/ml/code"
+    os.makedirs(destination_dir, exist_ok=True)
+
+    destination_path = os.path.join(destination_dir, os.path.basename(grafana_path))
+    logger.info("Copying grafana archive from %s to %s", grafana_path, destination_path)
+    shutil.copy2(grafana_path, destination_path)
+
+    with tarfile.open(destination_path, "r:gz") as tar:
+        # The Grafana archive name and its top level folder do not match
+        # (grafana-12.0.1.linux-amd64.tar.gz extracts to grafana-v12.0.1), so the
+        # folder name is read from the archive instead of derived from the file name.
+        folder_name = _get_archive_root_folder(tar)
+        _safe_extract_all(tar, destination_dir)
+
+    extracted_folder_path = os.path.join(destination_dir, folder_name)
+    if not os.path.isdir(extracted_folder_path):
+        raise Exception(
+            f"Extraction failed: folder not found at {extracted_folder_path}"
+        )
+
+    logger.info("Successfully extracted grafana to %s", extracted_folder_path)
+    return folder_name
+
+
+def _build_grafana_command(grafana_folder_name: str, config_path: str) -> str:
+    """Build a safe grafana command string.
+
+    Args:
+        grafana_folder_name: Name of the grafana folder extracted in /opt/ml/code
+        config_path: Path to the grafana.ini configuration file
+
+    Returns:
+        Safely constructed grafana command string
+
+    Raises:
+        FileNotFoundError: If no grafana binary is found in the extracted folder
+    """
+    grafana_home = f"/opt/ml/code/{grafana_folder_name}"
+    bin_dir = os.path.join(grafana_home, "bin")
+    # Grafana 10+ ships a single `grafana` binary with a `server` subcommand, while
+    # earlier releases only ship `grafana-server`.
+    if os.path.isfile(os.path.join(bin_dir, "grafana")):
+        command = f"{shlex.quote(os.path.join(bin_dir, 'grafana'))} server"
+    elif os.path.isfile(os.path.join(bin_dir, "grafana-server")):
+        command = shlex.quote(os.path.join(bin_dir, "grafana-server"))
+    else:
+        raise FileNotFoundError(f"Grafana binary not found in {bin_dir}")
+
+    return (
+        f"{command} --homepath={shlex.quote(grafana_home)} "
+        f"--config={shlex.quote(config_path)}"
+    )
+
+
+def _wait_for_ray_grafana_config(timeout: int = GRAFANA_CONFIG_WAIT_SECONDS) -> bool:
+    """Wait for the Ray Dashboard to generate its Grafana configuration.
+
+    Shortly after the head node starts, the Dashboard writes grafana.ini, the
+    Prometheus datasource and the Ray dashboards (with the UIDs the Metrics tab
+    embeds) under RAY_GRAFANA_CONFIG_DIR. Provisioning Grafana from those files is
+    what makes the Metrics tab render without any manual dashboard import.
+
+    Args:
+        timeout: Maximum number of seconds to wait
+
+    Returns:
+        True if the configuration was generated, False otherwise
+    """
+    config_path = os.path.join(RAY_GRAFANA_CONFIG_DIR, "grafana.ini")
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        if os.path.exists(config_path):
+            return True
+        time.sleep(2)
+
+    return False
+
+
+def _write_grafana_fallback_config(prometheus_host: str, prometheus_name: str) -> None:
+    """Write a minimal Grafana configuration pointing at the local Prometheus.
+
+    Only used when the Ray Dashboard did not generate its own Grafana configuration.
+    The Ray dashboards are not provisioned in that case and must be imported from
+    grafana-dashboards/ manually.
+
+    Args:
+        prometheus_host: URL of the Prometheus server to use as datasource
+        prometheus_name: Name of the Prometheus datasource in Grafana
+    """
+    provisioning_dir = os.path.join(RAY_GRAFANA_CONFIG_DIR, "provisioning")
+    datasources_dir = os.path.join(provisioning_dir, "datasources")
+    os.makedirs(datasources_dir, exist_ok=True)
+
+    with open(os.path.join(RAY_GRAFANA_CONFIG_DIR, "grafana.ini"), "w") as f:
+        f.write(GRAFANA_INI_TEMPLATE.format(provisioning_dir=provisioning_dir))
+
+    datasource_config = {
+        "apiVersion": 1,
+        "datasources": [
+            {
+                "name": prometheus_name,
+                "type": "prometheus",
+                "access": "proxy",
+                "url": prometheus_host,
+                "isDefault": True,
+            }
+        ],
+    }
+    with open(os.path.join(datasources_dir, "default.yml"), "w") as f:
+        yaml.dump(datasource_config, f, default_flow_style=False)
+
+    logger.info("Wrote fallback Grafana configuration in %s", RAY_GRAFANA_CONFIG_DIR)
+
+
+def _launch_grafana(
+    args: argparse.Namespace, runtime_env: Dict[str, Any]
+) -> Optional[subprocess.Popen]:
+    """Start the embedded Grafana server on the head node.
+
+    Grafana is provisioned from the configuration generated by the Ray Dashboard, so
+    the Prometheus datasource and the dashboards embedded by the Metrics tab match the
+    running cluster. Failures are logged and never fail the training job: metrics are
+    still collected by Prometheus.
+
+    Args:
+        args: Command line arguments
+        runtime_env: Ray runtime environment configuration
+
+    Returns:
+        The Popen object of the Grafana process, or None if Grafana was not started
+    """
+    if not grafana_folder_name:
+        return None
+
+    try:
+        if not _wait_for_ray_grafana_config():
+            logger.warning(
+                "Ray did not generate a Grafana configuration in %s, falling back to a minimal one",
+                RAY_GRAFANA_CONFIG_DIR,
+            )
+            _write_grafana_fallback_config(
+                runtime_env.get("RAY_PROMETHEUS_HOST", "http://127.0.0.1:9090"),
+                runtime_env.get("RAY_PROMETHEUS_NAME", "Prometheus"),
+            )
+
+        grafana_home = f"/opt/ml/code/{grafana_folder_name}"
+        grafana_cmd = _build_grafana_command(
+            grafana_folder_name, os.path.join(RAY_GRAFANA_CONFIG_DIR, "grafana.ini")
+        )
+        grafana_env = {
+            "GF_PATHS_PROVISIONING": os.path.join(
+                RAY_GRAFANA_CONFIG_DIR, "provisioning"
+            ),
+            "GF_PATHS_DATA": os.path.join(grafana_home, "data"),
+            "GF_PATHS_LOGS": os.path.join(grafana_home, "data", "log"),
+            "GF_PATHS_PLUGINS": os.path.join(grafana_home, "data", "plugins"),
+            "GF_SERVER_HTTP_PORT": str(args.grafana_port),
+            # The Ray Dashboard renders Grafana panels in iframes without
+            # authenticating against Grafana, so embedding and anonymous read access
+            # are both required. Grafana is only reachable from inside the training
+            # container, or through SSM port forwarding.
+            "GF_SECURITY_ALLOW_EMBEDDING": "true",
+            "GF_AUTH_ANONYMOUS_ENABLED": "true",
+            "GF_AUTH_ANONYMOUS_ORG_ROLE": "Viewer",
+        }
+
+        logger.info("Starting embedded Grafana with command: %s", grafana_cmd)
+        process = _run_subprocess_command_async(
+            grafana_cmd,
+            wait_in_seconds=0,
+            stdout_file="/tmp/grafana_stdout.log",
+            stderr_file="/tmp/grafana_stderr.log",
+            env_vars=grafana_env,
+        )
+
+        health_url = f"http://127.0.0.1:{args.grafana_port}/api/health"
+        start_time = time.time()
+
+        logger.info(
+            "Waiting for Grafana to become ready (max %s seconds)...",
+            GRAFANA_WAIT_SECONDS,
+        )
+
+        while time.time() - start_time < GRAFANA_WAIT_SECONDS:
+            if process.poll() is not None:
+                logger.warning(
+                    "Grafana process exited with code %s", process.returncode
+                )
+                _read_and_log_process_logs("/tmp/grafana_stderr.log")
+                return None
+
+            try:
+                response = requests.get(health_url, timeout=5)
+                if response.status_code == 200:
+                    logger.info(
+                        "Grafana health check passed after %.1f seconds",
+                        time.time() - start_time,
+                    )
+                    return process
+            except Exception as e:
+                logger.debug("Grafana not ready yet: %s", e)
+
+            time.sleep(2)
+
+        logger.warning(
+            "Grafana did not become ready within %s seconds", GRAFANA_WAIT_SECONDS
+        )
+        _read_and_log_process_logs("/tmp/grafana_stderr.log")
+        return process
+
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Could not start the embedded Grafana server: %s", e)
+        return None
+
+
+def _shutdown_grafana() -> None:
+    """Terminate the embedded Grafana server if it is running."""
+    global grafana_process
+
+    if grafana_process is None:
+        return
+
+    if grafana_process.poll() is None:
+        logger.info("Shutting down grafana")
+        grafana_process.terminate()
+        try:
+            grafana_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            logger.warning("Grafana did not stop gracefully, killing it")
+            grafana_process.kill()
+
+    grafana_process = None
+
+
 def _is_efa_device_present() -> bool:
     """Return True only if an EFA device is actually attached to THIS node.
 
@@ -912,13 +1261,25 @@ def _create_runtime_environment(args: argparse.Namespace, env: Any) -> Dict[str,
     elif os.environ.get("RAY_GRAFANA_HOST") is not None:
         runtime_env["RAY_GRAFANA_IFRAME_HOST"] = os.environ.get("RAY_GRAFANA_HOST")
 
+    if args.grafana_path and args.include_dashboard:
+        # The embedded Grafana runs on the head node, next to the local Prometheus.
+        # The Dashboard backend queries it over loopback, while the browser loads the
+        # panel iframes through the SSM port forwarding, hence the different host.
+        # Values explicitly provided by the user always win.
+        runtime_env.setdefault(
+            "RAY_GRAFANA_HOST", f"http://127.0.0.1:{args.grafana_port}"
+        )
+        runtime_env.setdefault(
+            "RAY_GRAFANA_IFRAME_HOST", f"http://localhost:{args.grafana_port}"
+        )
+
     if runtime_env.get("RAY_PROMETHEUS_HOST") is not None:
         logger.info(
             "Configured Prometheus host: %s", runtime_env.get("RAY_PROMETHEUS_HOST")
         )
 
     if runtime_env.get("RAY_GRAFANA_HOST") is not None:
-        logger.info("Configured Grafana host: %s", os.environ.get("RAY_GRAFANA_HOST"))
+        logger.info("Configured Grafana host: %s", runtime_env.get("RAY_GRAFANA_HOST"))
 
     logger.info(
         "Ray runtime environment contains %d total environment variables",
@@ -1125,8 +1486,8 @@ def _log_environment_debug_info() -> None:
     logger.info("entry_script: %s", entry_script)
 
 
-def _read_and_log_prometheus_logs(log_file_path: str) -> None:
-    """Read and log the contents of a Prometheus log file.
+def _read_and_log_process_logs(log_file_path: str) -> None:
+    """Read and log the contents of a background process log file.
 
     Args:
         log_file_path: Path to the log file to read and log
@@ -1184,10 +1545,25 @@ def _validate_command(args: List[str]) -> None:
         executable in ["ray", "bash"]
         or executable.startswith("./prometheus-")
         or executable.startswith("/opt/ml/code/prometheus-")
+        or _is_grafana_executable(executable)
     ):
         return
 
     raise ValueError(f"Command not allowed: {executable}")
+
+
+def _is_grafana_executable(executable: str) -> bool:
+    """Check whether an executable is a Grafana binary extracted in /opt/ml/code.
+
+    Args:
+        executable: Path of the executable to check
+
+    Returns:
+        True if the executable is an allowed Grafana binary
+    """
+    return executable.startswith("/opt/ml/code/grafana-") and os.path.basename(
+        executable
+    ) in ("grafana", "grafana-server")
 
 
 def _run_subprocess_command_with_env(
@@ -1447,7 +1823,7 @@ def _setup_head_node(
     Returns:
         Return code from Ray stop command
     """
-    global ray_initialized, has_failure, prometheus_folder_name
+    global ray_initialized, has_failure, prometheus_folder_name, grafana_process
 
     try:
         num_cpus = (
@@ -1585,7 +1961,10 @@ def _setup_head_node(
                     PROMETHEUS_WAIT_SECONDS,
                 )
 
-            _read_and_log_prometheus_logs("/tmp/prometheus_stderr.log")
+            _read_and_log_process_logs("/tmp/prometheus_stderr.log")
+
+        if args.include_dashboard and args.grafana_path:
+            grafana_process = _launch_grafana(args, runtime_env)
 
         ray_initialized = True
 
@@ -1634,6 +2013,8 @@ def _setup_head_node(
     finally:
         if not has_failure:
             _wait_before_shutdown(args.wait_shutdown)
+
+        _shutdown_grafana()
 
         if args.include_dashboard and args.launch_prometheus:
             logger.info("Shutting down prometheus")
@@ -1779,7 +2160,7 @@ def _setup_single_node_ray(
         runtime_env: Ray runtime environment configuration
         env: SageMaker environment variables object (for instance_type labeling)
     """
-    global ray_initialized, has_failure, prometheus_folder_name
+    global ray_initialized, has_failure, prometheus_folder_name, grafana_process
 
     logger.info("Found a single host, initializing Ray as a single node")
     try:
@@ -1901,7 +2282,10 @@ def _setup_single_node_ray(
                     PROMETHEUS_WAIT_SECONDS,
                 )
 
-            _read_and_log_prometheus_logs("/tmp/prometheus_stderr.log")
+            _read_and_log_process_logs("/tmp/prometheus_stderr.log")
+
+        if args.include_dashboard and args.grafana_path:
+            grafana_process = _launch_grafana(args, runtime_env)
 
         ray_initialized = True
         _run_script(runtime_env)
@@ -1912,6 +2296,8 @@ def _setup_single_node_ray(
     finally:
         if not has_failure:
             _wait_before_shutdown(args.wait_shutdown)
+
+        _shutdown_grafana()
 
         if args.include_dashboard and args.launch_prometheus:
             logger.info("Shutting down prometheus")
@@ -2073,7 +2459,7 @@ def main() -> int:
     Returns:
         Exit code (0 for success, non-zero for failure)
     """
-    global has_failure, prometheus_folder_name
+    global has_failure, prometheus_folder_name, grafana_folder_name
     try:
         # Parse only the arguments we care about and ignore the rest
         args, unknown = _parse_args()
@@ -2092,6 +2478,15 @@ def main() -> int:
         if args.prometheus_path:
             prometheus_folder_name = _copy_prometheus_binary(args.prometheus_path)
             logger.info("Prometheus folder name set to: %s", prometheus_folder_name)
+
+        # Copy and extract grafana if path is provided. Observability is best effort:
+        # a broken Grafana archive must not fail the training job.
+        if args.grafana_path and args.include_dashboard:
+            try:
+                grafana_folder_name = _copy_grafana_binary(args.grafana_path)
+                logger.info("Grafana folder name set to: %s", grafana_folder_name)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Could not extract the grafana archive: %s", e)
 
         # Set up Ray environment and run the specified script
         if env.is_hetero:
