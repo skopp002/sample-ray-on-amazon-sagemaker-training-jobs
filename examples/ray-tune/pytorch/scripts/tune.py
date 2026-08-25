@@ -15,6 +15,7 @@ import torchvision.transforms as transforms
 from filelock import FileLock
 from torch.utils.data import random_split
 
+import ray
 from ray import tune
 from ray.tune import RunConfig
 from ray.tune.schedulers import ASHAScheduler
@@ -29,6 +30,16 @@ def parse_args():
     )
     parser.add_argument(
         "--smoke_test", action="store_true", help="Run smoke test with fake data"
+    )
+    parser.add_argument(
+        "--storage_path",
+        type=str,
+        default=None,
+        help=(
+            "Ray Tune storage path for trial results and checkpoints. Must be a "
+            "URI reachable from every node (e.g. s3://bucket/prefix) on a "
+            "multi-node cluster. Defaults to node-local /opt/ml/output/data."
+        ),
     )
 
     # Parse only the arguments we care about and ignore the rest
@@ -67,6 +78,36 @@ def setup_logging():
 
 
 logger = setup_logging()
+
+# Node-local default. SageMaker gives each instance its own /opt/ml/output/data;
+# it is NOT a shared filesystem.
+LOCAL_STORAGE_PATH = "/opt/ml/output/data"
+
+
+def resolve_storage_path(storage_path=None):
+    """Pick the Ray Tune storage path and warn if it cannot work multi-node.
+
+    Ray Tune writes every trial's results and checkpoints to storage_path and
+    expects all nodes to see the same location. A node-local directory therefore
+    only works on a single-node cluster; for multi-node runs pass an S3 URI (or
+    another shared filesystem) via --storage_path.
+    """
+    if storage_path:
+        logger.info(f"Using shared Ray Tune storage path: {storage_path}")
+        return storage_path
+
+    num_nodes = len([n for n in ray.nodes() if n.get("Alive")])
+    if num_nodes > 1:
+        logger.warning(
+            "Ray Tune storage_path defaults to the node-local %s, but this "
+            "cluster has %d nodes. Trial results and checkpoints written on a "
+            "worker will not be visible to the driver, which can fail restores "
+            "and lose the best checkpoint. Pass --storage_path s3://<bucket>/"
+            "<prefix> for multi-node runs.",
+            LOCAL_STORAGE_PATH,
+            num_nodes,
+        )
+    return LOCAL_STORAGE_PATH
 
 
 def load_data(data_dir="./data"):
@@ -122,7 +163,10 @@ def load_test_data():
 
 def train_cifar(config):
     net = Net(config["l1"], config["l2"])
-    device = config["device"]
+    # Resolve the device on the WORKER, not on the driver. The Ray head may be a
+    # CPU-only coordinator (head_num_gpus=0) while the workers have GPUs, so a
+    # driver-side torch.cuda.is_available() would pin every trial to CPU.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda":
         net = nn.DataParallel(net)
     net.to(device)
@@ -202,7 +246,8 @@ def train_cifar(config):
 
 def test_best_model(best_result, smoke_test=False):
     best_trained_model = Net(best_result.config["l1"], best_result.config["l2"])
-    device = best_result.config["device"]
+    # Runs on the driver, so this is the driver's own device.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda":
         best_trained_model = nn.DataParallel(best_trained_model)
     best_trained_model.to(device)
@@ -256,8 +301,17 @@ if __name__ == "__main__":
         "max_num_epochs": (
             args.max_epochs if args.max_epochs else (10 if not args.smoke_test else 2)
         ),
-        "device": "cuda" if torch.cuda.is_available() else "cpu",
     }
+
+    # Size trial resources from the CLUSTER, not from the driver. On a
+    # heterogeneous cluster the head is often a CPU-only coordinator, so
+    # torch.cuda.is_available() here would report no GPU even when every worker
+    # has one, and Tune would schedule all trials on CPU.
+    cluster_gpus = int(ray.cluster_resources().get("GPU", 0))
+    gpus_per_trial = 1 if cluster_gpus > 0 else 0
+    logger.info(
+        f"Cluster reports {cluster_gpus} GPU(s); requesting {gpus_per_trial} GPU per trial"
+    )
 
     scheduler = ASHAScheduler(
         time_attr="training_iteration",
@@ -269,7 +323,7 @@ if __name__ == "__main__":
     tuner = tune.Tuner(
         tune.with_resources(
             tune.with_parameters(train_cifar),
-            resources={"cpu": 2, "gpu": 1 if torch.cuda.is_available() else 0},
+            resources={"cpu": 2, "gpu": gpus_per_trial},
         ),
         tune_config=tune.TuneConfig(
             metric="loss",
@@ -277,9 +331,7 @@ if __name__ == "__main__":
             scheduler=scheduler,
             num_samples=config["num_trials"],
         ),
-        run_config=RunConfig(
-            storage_path="/opt/ml/output/data"  # Use SageMaker's shared output directory
-        ),
+        run_config=RunConfig(storage_path=resolve_storage_path(args.storage_path)),
         param_space=config,
     )
     results = tuner.fit()

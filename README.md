@@ -25,15 +25,16 @@ This repository demonstrates how to use Ray for distributed data processing and 
 ## Prerequisites
 
 - AWS account with Amazon SageMaker AI access
-- Ray 2.0.0+
-- SageMaker Python SDK >=3.5.0
+- Ray 2.44+ (the pinned version is `ray[data,train,tune,serve]==2.56.1`). The Grafana dashboard reads Ray Train **V2** metrics (`ray_train_controller_state`, `ray_train_report_total_blocked_time_s`), which older releases do not export
+- SageMaker Python SDK >=3.16.0 (the examples use the v3 `ModelTrainer` API from `sagemaker.train`)
 
 ## Project Structure
 
 ```
-ray-sagemaker-training/
+sample-ray-on-amazon-sagemaker-training-jobs/
 ├── scripts/
-│    └── launcher.py
+│    ├── launcher.py
+│    └── requirements.txt
 ├── examples/
 │    ├── ray-remote/
 │    │    ├── pytorch/                    # Homogeneous cluster
@@ -86,8 +87,7 @@ ray-sagemaker-training/
 │                   ├── train_ray.py
 │                   └── requirements.txt
 ├── grafana-dashboards/
-│    ├── ray_default_dashboard.json
-│    └── ray_train_dashboard.json
+│    └── ray_sagemaker_training_dashboard.json
 └── images/
 ```
 
@@ -111,6 +111,11 @@ The `launcher.py` script serves as the entry point for SageMaker training jobs a
 
 **Ray Autoscaler is not supported.** SageMaker training jobs use a fixed number of instances defined at job creation time. The Ray cluster size is determined by the SageMaker cluster configuration (`instance_count` or `instance_groups`), and cannot be dynamically scaled during execution. All nodes are provisioned at the start of the job and remain available until the job completes.
 
+**IAM permissions used by the launcher itself.** Beyond the usual SageMaker training permissions, the execution role should allow:
+
+- `ec2:DescribeInstanceTypes` — the launcher queries it at startup to discover which instance types support EFA. Without it the call fails and the launcher silently falls back to a static, hard-coded list, which may not include newer instance types.
+- `s3:GetObject` on the bucket holding your Prometheus tarball, if you pass one via `--prometheus-path` as an InputData channel.
+
 You should:
 
 - Write your own Ray scripts for data processing or model training
@@ -124,22 +129,24 @@ The `launcher.py` script requires specific parameters to execute your custom tra
 
 ### Parameter Reference
 
-| Argument                | Type   | Required | Default          | Description                                                              |
-| ----------------------- | ------ | -------- | ---------------- | ------------------------------------------------------------------------ |
-| `-e`, `--entrypoint`    | string | Yes      | None             | Path to your script (e.g., `train.py`, `training/train.py`, `run.sh`)    |
-| `--head-instance-group` | string | Yes\*    | None             | Instance group name for Ray head node (heterogeneous clusters only)      |
-| `--head-num-cpus`       | int    | No       | Instance default | Number of CPUs reserved for head node                                    |
-| `--head-num-gpus`       | int    | No       | Instance default | Number of GPUs reserved for head node                                    |
-| `--include-dashboard`   | bool   | No       | True             | Enable Ray dashboard                                                     |
-| `--launch-prometheus`   | bool   | No       | True             | Launch local Prometheus on the head node. Internet connectivity required |
-| `--prometheus-path`     | string | No       | None             | Path to prometheus binary if provided as InputData                       |
-| `--wait-shutdown`       | int    | No       | None             | Seconds to wait before Ray shutdown                                      |
+| Argument                | Type   | Required | Default          | Env-var fallback      | Description                                                              |
+| ----------------------- | ------ | -------- | ---------------- | --------------------- | ------------------------------------------------------------------------ |
+| `-e`, `--entrypoint`    | string | Yes      | None             | none\*\*              | Path to your script (e.g., `train.py`, `training/train.py`, `run.sh`)    |
+| `--head-instance-group` | string | Yes\*    | None             | `head_instance_group` | Instance group name for Ray head node (heterogeneous clusters only)      |
+| `--head-num-cpus`       | int    | No       | Instance default | `head_num_cpus`       | Number of CPUs reserved for head node                                    |
+| `--head-num-gpus`       | int    | No       | Instance default | `head_num_gpus`       | Number of GPUs reserved for head node                                    |
+| `--include-dashboard`   | bool   | No       | True             | **none**              | Enable Ray dashboard                                                     |
+| `--launch-prometheus`   | bool   | No       | True             | `launch_prometheus`   | Launch local Prometheus on the head node. Internet connectivity required |
+| `--prometheus-path`     | string | No       | None             | `prometheus_path`     | Path to prometheus binary if provided as InputData                       |
+| `--wait-shutdown`       | int    | No       | None             | `wait_shutdown`       | Seconds to wait before Ray shutdown                                      |
 
 \*Required only for heterogeneous clusters
 
+\*\*`--entrypoint` itself has no env-var fallback, but it is equivalent to setting the `source_dir` and `entry_script` environment variables directly: `-e training/train.py` is the same as `source_dir=training`, `entry_script=train.py`.
+
 ### Environment Variables Reference
 
-All parameters above can also be set as environment variables via the `environment` dict in your ModelTrainer or Estimator configuration. Environment variables are used as fallback when the corresponding command line argument is not provided.
+Most parameters above can also be set as environment variables via the `environment` dict in your ModelTrainer or Estimator configuration — see the "Env-var fallback" column for the exact name. Environment variables are used as fallback when the corresponding command line argument is not provided, **except** `launch_prometheus`, which currently takes precedence over `--launch-prometheus`. `--include-dashboard` can only be set on the command line.
 
 | Variable                  | Type   | Required | Description                                                                                                                                                             |
 | ------------------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -151,7 +158,8 @@ All parameters above can also be set as environment variables via the `environme
 | `wait_shutdown`           | int    | No       | Alternative way to set shutdown wait time                                                                                                                               |
 | `RAY_PROMETHEUS_HOST`     | string | No       | Prometheus host URL. When set to a remote URL (not localhost), enables remote_write from local Prometheus to the remote endpoint. For AMP URLs, SigV4 auth is automatic |
 | `RAY_PROMETHEUS_NAME`     | string | No       | Prometheus data source name in Grafana (default: `Prometheus`). Used by the Ray Dashboard for Grafana integration                                                       |
-| `RAY_GRAFANA_HOST`        | string | No       | Grafana server URL. Used by Ray Dashboard for server-side API calls and browser-side iframe embedding                                                                   |
+| `RAY_GRAFANA_HOST`        | string | No       | Grafana server URL. Used by the Ray Dashboard for server-side API calls, and as the default for `RAY_GRAFANA_IFRAME_HOST`                                                |
+| `RAY_GRAFANA_IFRAME_HOST` | string | No       | Grafana URL the **browser** uses to load embedded panels. Set this when the Dashboard reaches Grafana at a different address than your browser does (e.g. port-forwarding). Defaults to `RAY_GRAFANA_HOST` |
 | `RAY_PROMETHEUS_USERNAME` | string | No       | Username for basic auth when remote writing to a self-hosted Prometheus server                                                                                          |
 | `RAY_PROMETHEUS_PASSWORD` | string | No       | Password for basic auth when remote writing to a self-hosted Prometheus server                                                                                          |
 | `FI_PROVIDER`             | string | No       | libfabric provider for EFA networking. Leave unset to let the launcher autodetect (see [EFA / RDMA networking](#efa--rdma-networking)). Set explicitly to override      |
@@ -489,7 +497,7 @@ Set `RAY_PROMETHEUS_HOST` to the remote Prometheus base URL. The launcher will:
 
 1. Keep the local Prometheus running and the Ray Dashboard connected to it (`http://127.0.0.1:9090`)
 2. Automatically inject a `remote_write` section into the local Prometheus configuration
-3. Build the remote write URL by appending `/api/v1/remote_write` to the provided host
+3. Build the remote write URL from the provided host: `/api/v1/remote_write` is appended for AMP endpoints, `/api/v1/write` for any other (self-hosted) Prometheus
 
 #### Amazon Managed Service for Prometheus (AMP)
 
@@ -567,7 +575,7 @@ By default, Ray downloads the Prometheus binary from the internet. In environmen
 **Step 1:** Download the Prometheus binary:
 
 ```bash
-wget https://github.com/prometheus/prometheus/releases/download/v3.4.2/prometheus-3.4.2.linux-amd64.tar.gz
+wget https://github.com/prometheus/prometheus/releases/download/v3.13.1/prometheus-3.13.1.linux-amd64.tar.gz
 ```
 
 **Step 2:** Upload to S3 and configure as training input:
@@ -579,7 +587,7 @@ prometheus_input = InputData(
     channel_name="prometheus",
     data_source=S3DataSource(
         s3_data_type="S3Prefix",
-        s3_uri="s3://<bucket>/path/to/prometheus-3.4.2.linux-amd64.tar.gz",
+        s3_uri="s3://<bucket>/path/to/prometheus-3.13.1.linux-amd64.tar.gz",
         s3_data_distribution_type="FullyReplicated",
     ),
 )
@@ -591,18 +599,21 @@ prometheus_input = InputData(
 source_code = SourceCode(
     source_dir="./scripts",
     requirements="requirements.txt",
-    command="python launcher.py --entrypoint train_ray.py --prometheus-path /opt/ml/input/data/prometheus/prometheus-3.4.2.linux-amd64.tar.gz",
+    command="python launcher.py --entrypoint train_ray.py --prometheus-path /opt/ml/input/data/prometheus/prometheus-3.13.1.linux-amd64.tar.gz",
 )
 ```
 
 ### Grafana Dashboards
 
-This repository includes pre-built Ray Grafana dashboards in the [`grafana-dashboards/`](./grafana-dashboards) directory:
+This repository includes a pre-built Ray Grafana dashboard in the [`grafana-dashboards/`](./grafana-dashboards) directory:
 
-| Dashboard                    | Description                                                                                       |
-| ---------------------------- | ------------------------------------------------------------------------------------------------- |
-| `ray_default_dashboard.json` | Cluster overview: CPU, GPU utilization, memory, disk, network, and Ray system metrics (38 panels) |
-| `ray_train_dashboard.json`   | Ray Train specific metrics for training jobs (5 panels)                                           |
+| Dashboard                               | Description                                                                                                                                                                               |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ray_sagemaker_training_dashboard.json` | Combined cluster and Ray Train metrics: CPU/GPU utilization, memory, GRAM, disk, network, tasks and actors, logical resources, and Ray Train controller/worker timings (7 rows, 25 panels) |
+
+The dashboard exposes template variables to narrow down what you are looking at: `SessionName`, `Instance`, `RayNodeType`, `TrainRunName`, `TrainRunId`, `TrainWorkerWorldRank`, `TrainWorkerActorId`, plus two SageMaker-specific ones — `TrainingJobName` and `InstanceType`. The last two are driven by the `sagemaker_training_job_name` and `instance_type` labels that the launcher adds to the Prometheus scrape configuration automatically, so filtering by training job or by instance type works with no extra setup. `InstanceType` is what makes heterogeneous clusters readable, since each node reports its own type.
+
+> **Note:** the `Node Count` panel and the "PENDING" series of the `Logical CPUs/GPUs Usage` panels read `autoscaler_*` metrics. Because the Ray Autoscaler is not used on SageMaker (the cluster is fixed at job creation), those series stay empty or flat. This is expected, not a broken dashboard.
 
 #### Importing Dashboards
 

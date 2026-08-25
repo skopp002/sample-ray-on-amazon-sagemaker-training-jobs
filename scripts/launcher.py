@@ -11,7 +11,7 @@ from __future__ import absolute_import
 import argparse
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
-import importlib
+import importlib.util
 import logging
 import os
 import requests
@@ -614,19 +614,11 @@ def _inject_remote_write_config(
         if config is None:
             config = {}
 
-        # Stamp the SageMaker training job name as a constant external label so
-        # every remote-written series can be filtered by it in Grafana (a
-        # "TrainingJobName" dashboard variable). Prometheus applies
-        # external_labels to all remote_write samples without overriding a
-        # series' own labels, and the name is chosen not to collide with Ray's
-        # labels. Merges with any existing global block.
-        training_job_name = os.environ.get("TRAINING_JOB_NAME")
-        if training_job_name:
-            global_cfg = config.get("global") or {}
-            external_labels = global_cfg.get("external_labels") or {}
-            external_labels["sagemaker_training_job_name"] = training_job_name
-            global_cfg["external_labels"] = external_labels
-            config["global"] = global_cfg
+        # NOTE: the sagemaker_training_job_name label is NOT stamped here.
+        # external_labels apply only to remote_write samples, which would leave
+        # the label missing on the local Prometheus that backs the Ray
+        # Dashboard. It is injected as a scrape-time relabel instead (see
+        # _inject_sagemaker_relabels), so it is present in both.
 
         remote_write_entry = {
             "url": remote_write_url,
@@ -718,17 +710,28 @@ def _build_ip_instance_type_map(env: Any) -> Dict[str, str]:
     return mapping
 
 
-def _inject_instance_type_relabel(
-    config_path: Optional[str], ip_type_map: Dict[str, str]
+def _inject_sagemaker_relabels(
+    config_path: Optional[str],
+    ip_type_map: Dict[str, str],
+    training_job_name: Optional[str] = None,
 ) -> None:
-    """Add scrape-time relabel_configs so each node's series get an instance_type label.
+    """Add scrape-time relabel_configs for the SageMaker-specific labels.
 
     relabel_configs run at scrape time (before ingestion and remote_write), so
-    the added label reaches Prometheys. Each rule matches the target's __address__
-    (<ip>:<port>) and sets instance_type to the mapped value. Must run before
-    Prometheus reads its config (i.e. before launch).
+    the added labels reach both the local Prometheus that backs the Ray
+    Dashboard and any remote_write destination. This is why they are used here
+    instead of global external_labels, which only apply to remote_write.
+
+    Two labels are added, both consumed by dashboard variables:
+      - instance_type: per node, matched on the target's __address__
+        (<ip>:<port>), since it differs per node on a heterogeneous cluster.
+      - sagemaker_training_job_name: constant for the whole job.
+
+    Must run before Prometheus reads its config (i.e. before launch).
     """
-    if not ip_type_map or not config_path or not os.path.exists(config_path):
+    if not config_path or not os.path.exists(config_path):
+        return
+    if not ip_type_map and not training_job_name:
         return
     try:
         with open(config_path, "r") as f:
@@ -741,7 +744,7 @@ def _inject_instance_type_relabel(
             jobs[0] if jobs else None,
         )
         if ray_job is None:
-            logger.warning("No scrape_configs found; skipping instance_type relabel")
+            logger.warning("No scrape_configs found; skipping SageMaker relabels")
             return
 
         relabels = ray_job.setdefault("relabel_configs", [])
@@ -755,14 +758,28 @@ def _inject_instance_type_relabel(
                 }
             )
 
+        if training_job_name:
+            # Matches every target, so the label lands on all scraped series.
+            relabels.append(
+                {
+                    "source_labels": ["__address__"],
+                    "regex": ".*",
+                    "target_label": "sagemaker_training_job_name",
+                    "replacement": training_job_name,
+                }
+            )
+
         with open(config_path, "w") as f:
             yaml.dump(config, f, default_flow_style=False)
 
         logger.info(
-            "Injected instance_type relabel_configs for %d node(s)", len(ip_type_map)
+            "Injected relabel_configs: instance_type for %d node(s), "
+            "sagemaker_training_job_name=%s",
+            len(ip_type_map),
+            training_job_name or "<unset>",
         )
     except Exception as e:  # noqa: BLE001
-        logger.error("Failed to inject instance_type relabel: %s", e)
+        logger.error("Failed to inject SageMaker relabels: %s", e)
 
 
 def _is_efa_device_present() -> bool:
@@ -1509,15 +1526,18 @@ def _setup_head_node(
                     basic_auth=basic_auth,
                 )
 
-            # Add a per-node instance_type label via scrape-time relabeling so the
-            # dashboard can filter by instance type (e.g. ml.g4dn.12xlarge). This
-            # runs regardless of remote_write and must happen before launch, since
-            # Prometheus reads its config only at startup.
-            instance_type_config_path = _get_prometheus_config_path(
+            # Add the instance_type and sagemaker_training_job_name labels via
+            # scrape-time relabeling so the dashboard can filter by instance type
+            # (e.g. ml.g4dn.12xlarge) and by training job. This runs regardless of
+            # remote_write and must happen before launch, since Prometheus reads
+            # its config only at startup.
+            relabel_config_path = _get_prometheus_config_path(
                 use_ray_template=not use_custom_prometheus
             )
-            _inject_instance_type_relabel(
-                instance_type_config_path, _build_ip_instance_type_map(env)
+            _inject_sagemaker_relabels(
+                relabel_config_path,
+                _build_ip_instance_type_map(env),
+                training_job_name=os.environ.get("TRAINING_JOB_NAME"),
             )
 
             logger.info("Launching prometheus")
@@ -1707,7 +1727,15 @@ def _get_cluster_configuration(
         env: SageMaker environment variables
 
     Returns:
-        Tuple of (all_hosts, head_host, total_host_count)
+        Tuple of (all_hosts, head_host, compute_host_count)
+
+        compute_host_count counts only the hosts that CONTRIBUTE COMPUTE, so it
+        excludes a coordinator-only head. It is reported for observability and
+        must NOT be used to decide the cluster topology: use len(all_hosts),
+        which is the number of instances in the job. The two differ whenever the
+        head is coordinator-only, and a job with a coordinator head plus a
+        single worker has compute_host_count == 1 while genuinely being a
+        two-instance cluster.
     """
     if env.is_hetero:
         return _get_heterogeneous_cluster_config(args, env)
@@ -1716,7 +1744,11 @@ def _get_cluster_configuration(
 
 
 def _get_homogeneous_cluster_config(env: Any) -> Tuple[List[str], str, int]:
-    """Get configuration for homogeneous cluster."""
+    """Get configuration for homogeneous cluster.
+
+    Every host runs the same instance type and contributes compute, so
+    compute_host_count is simply the number of hosts.
+    """
     hosts = env.hosts
     head_host = hosts[0] if hosts else ""
     return hosts, head_host, len(hosts)
@@ -1728,7 +1760,7 @@ def _get_heterogeneous_cluster_config(
     """Get configuration for heterogeneous cluster."""
     all_hosts = []
     head_host = ""
-    total_host_count = 0
+    compute_host_count = 0
 
     # Find head instance group and collect all hosts
     for instance_group in env.instance_groups_dict.values():
@@ -1750,22 +1782,24 @@ def _get_heterogeneous_cluster_config(
                 head_num_gpus = env.num_gpus
 
             if head_num_cpus == 0 and head_num_gpus == 0:
-                # Head node is coordinator only, exclude from worker count
-                total_host_count += len(group_hosts) - 1
+                # The head itself contributes no compute. Any OTHER host in the
+                # head group still joins as a normal worker with full resources,
+                # so only the head is excluded.
+                compute_host_count += len(group_hosts) - 1
                 logger.info("Head node configured as coordinator only (0 CPUs, 0 GPUs)")
             else:
                 # Head node participates in computation
-                total_host_count += len(group_hosts)
+                compute_host_count += len(group_hosts)
         else:
             # All hosts in non-head groups are workers
-            total_host_count += len(group_hosts)
+            compute_host_count += len(group_hosts)
 
     if not head_host:
         raise ValueError(
             "Head instance group '%s' not found" % args.head_instance_group
         )
 
-    return all_hosts, head_host, total_host_count
+    return all_hosts, head_host, compute_host_count
 
 
 def _setup_single_node_ray(
@@ -1782,6 +1816,21 @@ def _setup_single_node_ray(
     global ray_initialized, has_failure, prometheus_folder_name
 
     logger.info("Found a single host, initializing Ray as a single node")
+
+    # On a one-instance job the single node has to do the work, so it always
+    # starts with Ray's autodetected resources. Reserving 0 CPUs/GPUs here would
+    # leave nothing able to run a task, so an explicit head reservation is
+    # deliberately ignored rather than honored - say so instead of doing it
+    # silently.
+    if args.head_num_cpus == 0 or args.head_num_gpus == 0:
+        logger.warning(
+            "Ignoring head_num_cpus=%s / head_num_gpus=%s: this job has a single "
+            "instance, which must contribute compute. A coordinator-only head "
+            "only makes sense on a multi-instance cluster.",
+            args.head_num_cpus,
+            args.head_num_gpus,
+        )
+
     try:
         # Build Ray start command (no runtime-env option available in CLI)
         ray_cmd = f"ray start --head --port={DEFAULT_RAY_PORT}"
@@ -1827,14 +1876,16 @@ def _setup_single_node_ray(
                     basic_auth=basic_auth,
                 )
 
-            # Add a per-node instance_type label via scrape-time relabeling so the
-            # dashboard can filter by instance type (single-node is homogeneous).
-            # Must happen before launch; Prometheus reads its config only at startup.
-            instance_type_config_path = _get_prometheus_config_path(
+            # Add the instance_type and sagemaker_training_job_name labels via
+            # scrape-time relabeling (single-node is homogeneous). Must happen
+            # before launch; Prometheus reads its config only at startup.
+            relabel_config_path = _get_prometheus_config_path(
                 use_ray_template=not use_custom_prometheus
             )
-            _inject_instance_type_relabel(
-                instance_type_config_path, _build_ip_instance_type_map(env)
+            _inject_sagemaker_relabels(
+                relabel_config_path,
+                _build_ip_instance_type_map(env),
+                training_job_name=os.environ.get("TRAINING_JOB_NAME"),
             )
 
             logger.info("Launching prometheus")
@@ -2000,13 +2051,18 @@ def _setup_ray_environment_homogeneous_cluster(
     _log_environment_debug_info()
 
     # Get cluster configuration
-    all_hosts, head_host, total_host_count = _get_cluster_configuration(args, env)
+    all_hosts, head_host, compute_host_count = _get_cluster_configuration(args, env)
 
-    logger.info("Homogeneous cluster configuration: %s total hosts", total_host_count)
+    logger.info(
+        "Homogeneous cluster configuration: %s instances, %s contributing compute",
+        len(all_hosts),
+        compute_host_count,
+    )
     logger.info("All hosts: %s", all_hosts)
 
-    # Single-node workload scenario
-    if total_host_count == 1:
+    # Single-node workload scenario. Decided on the number of INSTANCES in the
+    # job (see _get_cluster_configuration on why not compute_host_count).
+    if len(all_hosts) == 1:
         return _setup_single_node_ray(args, runtime_env, env)
 
     # Multi-node workload scenario
@@ -2038,15 +2094,23 @@ def _setup_ray_environment_heterogeneous_cluster(
     _log_environment_debug_info()
 
     # Get cluster configuration
-    all_hosts, head_host, total_host_count = _get_cluster_configuration(args, env)
+    all_hosts, head_host, compute_host_count = _get_cluster_configuration(args, env)
 
-    logger.info("Heterogeneous cluster configuration: %s total hosts", total_host_count)
+    logger.info(
+        "Heterogeneous cluster configuration: %s instances, %s contributing compute",
+        len(all_hosts),
+        compute_host_count,
+    )
     logger.info("Head instance group: %s", args.head_instance_group)
     logger.info("Head host: %s", head_host)
     logger.info("All hosts: %s", all_hosts)
 
-    # Single-node workload scenario
-    if total_host_count == 1:
+    # Single-node workload scenario. Decided on the number of INSTANCES in the
+    # job, never on compute_host_count: with a coordinator-only head the latter
+    # is 1 for a real two-instance cluster, which would send BOTH instances down
+    # the single-node path so each starts its own Ray cluster and runs the entry
+    # script (see _get_cluster_configuration).
+    if len(all_hosts) == 1:
         return _setup_single_node_ray(args, runtime_env, env)
 
     # Multi-node workload scenario

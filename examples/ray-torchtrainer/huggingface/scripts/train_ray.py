@@ -1964,7 +1964,11 @@ def train_func(config):
     config_builder = ModelConfigBuilder(script_args, training_args)
     mlflow_enabled = is_mlflow_enabled(script_args)
 
-    if script_args.token is not None:
+    # Truthiness, not "is not None": args.yaml renders token from ${HF_TOKEN},
+    # which becomes an empty string when that variable is unset. Exporting
+    # HF_TOKEN="" makes huggingface_hub send an empty credential instead of
+    # falling back to anonymous access.
+    if script_args.token:
         os.environ.update({"HF_TOKEN": script_args.token})
         if dist.is_initialized():
             logger.info("Waiting for all processes after setting HF token")
@@ -2257,8 +2261,25 @@ def main():
         num_workers=num_workers, use_gpu=num_gpus > 0
     )
 
+    # Ray Train writes trial results and checkpoints to storage_path and expects
+    # every node to see the same location. env.output_data_dir is node-local on
+    # SageMaker (each instance gets its own /opt/ml/output/data), so it is only
+    # safe on a single-node cluster. For multi-node runs set RAY_STORAGE_PATH to
+    # an S3 URI (or another shared filesystem) in the ModelTrainer environment
+    # dict; the launcher forwards it to every worker.
+    storage_path = os.environ.get("RAY_STORAGE_PATH") or env.output_data_dir
+    num_nodes = len([n for n in ray.nodes() if n.get("Alive")])
+    if not os.environ.get("RAY_STORAGE_PATH") and num_nodes > 1:
+        logger.warning(
+            f"Ray Train storage_path defaults to the node-local "
+            f"{env.output_data_dir}, but this cluster has {num_nodes} nodes. "
+            f"Checkpoints written on a worker will not be visible to the driver, "
+            f"which can fail resume-from-checkpoint and lose the final model. "
+            f"Set RAY_STORAGE_PATH=s3://<bucket>/<prefix> for multi-node runs."
+        )
+
     run_config = RunConfig(
-        storage_path=env.output_data_dir,
+        storage_path=storage_path,
         name=env.job_name,
     )
 

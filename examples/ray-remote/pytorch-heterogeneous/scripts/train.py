@@ -1,7 +1,6 @@
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser
 import csv
 import emoji
-import json
 import logging
 from model import MulticlassClassifier
 import numpy as np
@@ -64,17 +63,7 @@ def __read_params():
 
         parser.add_argument("--epochs", type=int, default=25)
         parser.add_argument("--learning_rate", type=float, default=0.001)
-        parser.add_argument("--batch_size", type=int, default=100)
-        parser.add_argument("--dataset_percentage", type=str, default=100)
-        parser.add_argument(
-            "--output-data-dir", type=str, default=os.environ.get("SM_OUTPUT_DATA_DIR")
-        )
-        parser.add_argument(
-            "--train", type=str, default=os.environ.get("SM_CHANNEL_TRAIN")
-        )
-        parser.add_argument(
-            "--test", type=str, default=os.environ.get("SM_CHANNEL_TEST")
-        )
+        parser.add_argument("--dataset_percentage", type=int, default=100)
         parser.add_argument(
             "--model_dir", type=str, default=os.environ.get("SM_MODEL_DIR")
         )
@@ -84,17 +73,6 @@ def __read_params():
 
         if unknown:
             logger.info(f"Ignoring unknown arguments: {unknown}")
-
-        if len(vars(args)) == 0:
-            with open(
-                os.path.join(
-                    "/", "opt", "ml", "input", "config", "hyperparameters.json"
-                ),
-                "r",
-            ) as f:
-                training_params = json.load(f)
-
-            args = Namespace(**training_params)
 
         return args
     except Exception as e:
@@ -161,10 +139,15 @@ def process_sentiment_chunk(df_chunk: pd.DataFrame) -> pd.DataFrame:
     return df_chunk
 
 
-@ray.remote(num_cpus=1)
 def transform_data(df):
     """
     Transform data using Ray for distributed processing
+
+    Runs on the driver rather than as a Ray task: it fans work out to
+    clean_text_chunk / process_sentiment_chunk and then blocks on ray.get for
+    the results. As a task it would hold a CPU slot for its whole lifetime
+    while waiting on its own children, which oversubscribes a small cluster and
+    can deadlock when no slot is left to run them.
     """
     try:
         # Select relevant columns
@@ -352,10 +335,10 @@ if __name__ == "__main__":
         )
 
         # Extract data
-        df = extract_data(PROCESSING_PATH_INPUT, 100)
+        df = extract_data(PROCESSING_PATH_INPUT, args.dataset_percentage)
 
         # Transform data with Ray parallelization
-        df = ray.get(transform_data.remote(df))
+        df = transform_data(df)
 
         # Split data with fixed random state for reproducibility
         data_train, data_test = train_test_split(df, test_size=0.2, random_state=42)
