@@ -164,3 +164,15 @@ examples/**/launcher.py
 args.yaml
 */**/*.tar.
 .claude
+
+# Blog draft artifacts
+*.docx
+
+# Comic and diagram artifacts — the rendered PNGs are published in READMEs, so un-ignore
+# just those; the render script/source docs stay scratch.
+*/**/comic/
+*/**/diagrams/*
+!*/**/diagrams/*.png
+
+# Ad-hoc validation/test scratch artifacts (not for publishing)
+*/**/scratch/

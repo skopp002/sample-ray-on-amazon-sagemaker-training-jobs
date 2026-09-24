@@ -77,7 +77,7 @@ sample-ray-on-amazon-sagemaker-training-jobs/
 │    │              ├── tune.py
 │    │              ├── model.py
 │    │              └── requirements.txt
-│    └── ray-torchtrainer/
+│    ├── ray-torchtrainer/
 │         ├── huggingface/
 │         │    ├── notebook.ipynb
 │         │    └── scripts/
@@ -88,6 +88,23 @@ sample-ray-on-amazon-sagemaker-training-jobs/
 │              └── scripts/
 │                   ├── train_ray.py
 │                   └── requirements.txt
+│    └── ray-train/                       # Always the official Ray Train DLC
+│         ├── pytorch/                    # Homogeneous cluster
+│         │    ├── notebook.ipynb
+│         │    └── scripts/
+│         │         ├── train.py
+│         │         ├── model.py
+│         │         └── requirements.txt
+│         ├── pytorch-heterogeneous/      # Heterogeneous cluster
+│         │    ├── notebook.ipynb
+│         │    └── scripts/
+│         │         ├── train.py
+│         │         ├── model.py
+│         │         └── requirements.txt
+│         ├── ray_dlc_image.py            # resolves the Ray Train DLC's direct per-region URI
+│         └── diagrams/
+│              ├── layer-stack.png
+│              └── ray-train-flow.png
 ├── grafana-dashboards/
 │    └── ray_sagemaker_training_dashboard.json
 └── images/
@@ -228,7 +245,10 @@ Bash entry scripts are executed directly via `bash <script_path>`.
 
 ## Examples
 
-The repository includes 8 example notebooks covering 4 Ray patterns, each with both homogeneous and heterogeneous cluster configurations.
+The repository includes 10 example notebooks covering 5 Ray patterns, each with both
+homogeneous and heterogeneous cluster configurations. `ray-train` always runs on AWS's
+official Ray Train DLC — see [`examples/ray-train/README.md`](examples/ray-train/README.md)
+for the container details.
 
 Each notebook copies `launcher.py` into its local `scripts/` directory and launches a SageMaker training job using the PySDK v3 `ModelTrainer` API.
 
@@ -238,6 +258,7 @@ Each notebook copies `launcher.py` into its local `scripts/` directory and launc
 | **ray-data**         | Batch inference with `ray.data` using ResNet152 on Imagenette dataset                                                                    | 1x `ml.m5.2xlarge`  | 1x `ml.t3.large` (head) + 2x `ml.m5.2xlarge` (workers)  |
 | **ray-tune**         | Hyperparameter tuning with `ray.tune` and ASHA scheduler on CIFAR-10                                                                     | 1x `ml.m5.2xlarge`  | 1x `ml.t3.large` (head) + 2x `ml.m5.2xlarge` (workers)  |
 | **ray-torchtrainer** | Distributed LLM fine-tuning (LoRA/QLoRA) with `ray.train.torch.TorchTrainer`, HuggingFace Transformers, and optional MLflow/W&B tracking | 1x `ml.g5.12xlarge` | 1x `ml.t3.2xlarge` (head) + 4x `ml.g5.xlarge` (workers) |
+| **ray-train**        | Distributed data-parallel PyTorch training with `ray.train.torch.TorchTrainer` (ResNet on CIFAR-10) on the official Ray Train DLC, with distributed S3 checkpointing | 1x `ml.g5.12xlarge` | 1x `ml.t3.2xlarge` (head) + 4x `ml.g5.xlarge` (workers) |
 
 In heterogeneous configurations, the head node is configured as coordinator-only (`head_num_cpus=0`, `head_num_gpus=0`), while the worker instance group handles computation.
 
